@@ -1,166 +1,197 @@
-# monero-stratum
+# marsqnet-stratum
 
-High performance CryptoNote mining stratum with Web-interface written in Golang.
+A RandomX mining pool stratum server for Marscoin's **marsqnet** quantum-resistant testnet.
 
-[![Go Report Card](https://goreportcard.com/badge/github.com/sammy007/monero-stratum)](https://goreportcard.com/report/github.com/sammy007/monero-stratum)
-[![CircleCI](https://circleci.com/gh/sammy007/monero-stratum.svg?style=svg)](https://circleci.com/gh/sammy007/monero-stratum)
+Built in Go. Adapted from [sammy007/monero-stratum](https://github.com/sammy007/monero-stratum) with a full rewrite of the RPC layer, block construction, and hashing for Bitcoin-style nodes running RandomX.
 
-**Stratum feature list:**
+**Live pool:** [mining-mars.com/testnet](https://mining-mars.com/testnet)
 
-* Be your own pool
-* Rigs availability monitoring
-* Keep track of accepts, rejects, blocks stats
-* Easy detection of sick rigs
-* Daemon failover list
-* Concurrent shares processing
-* Beautiful Web-interface
+## Features
 
-![](screenshot.png)
+- **RandomX proof-of-work** via CGo bindings to librandomx
+- **Bitcoin-style RPC** -- connects to Marscoin Core nodes (not CryptoNote)
+- **xmrig-compatible stratum** protocol (login, submit, getjob, keepalived)
+- **Block construction** -- coinbase transactions, merkle trees, 80-byte headers
+- **Share validation** -- full RandomX hash verification per share
+- **Automatic block submission** when a share meets the network target
+- **Job broadcasting** -- pushes new work to all miners on new blocks
+- **Cookie auth** -- reads RPC credentials from the node's cookie file
+- **Multi-port** with configurable per-port difficulty
 
-## Installation
+## Quick Start
 
-Dependencies:
+### Prerequisites
 
-  * go-1.6
-  * Everything required to build Monero
-  * Monero >= **v0.14.0.0** (sometimes `master` branch required)
+- Go 1.18+
+- A running marsqnet node ([Marscoin Core](https://github.com/marscoin/marscoin) `feat/pow-randomx` branch)
+- GCC/G++ for building the RandomX library
 
-### Linux
+### 1. Build the RandomX library
 
-Use Ubuntu 16.04 LTS.
+The stratum server links against librandomx. Build it from the marsqnet node source:
 
-Compile Monero source (with shared libraries option):
+```bash
+# Assuming marsqnet node source is at /opt/marscoin-marsqnet
+RX_SRC=/opt/marscoin-marsqnet/src/crypto/randomx_vendor/src
+mkdir -p randomx/lib randomx/include
+cp $RX_SRC/randomx.h randomx/include/
 
-    apt-get install git cmake build-essential libssl-dev pkg-config libboost-all-dev
-    git clone --recursive https://github.com/monero-project/monero.git
-    cd monero
-    git checkout tags/v0.14.0.0 -b v0.14.0.0
-    cmake -DBUILD_SHARED_LIBS=1 .
-    make
+# Compile C files
+for f in argon2_core.c argon2_ref.c argon2_ssse3.c argon2_avx2.c reciprocal.c virtual_memory.c; do
+    gcc -c -fPIC -O2 -maes -mssse3 -mavx2 -I$RX_SRC -I$RX_SRC/blake2 $RX_SRC/$f -o /tmp/rx_$f.o
+done
+gcc -c -fPIC -O2 -I$RX_SRC/blake2 $RX_SRC/blake2/blake2b.c -o /tmp/rx_blake2b.o
+gcc -c -fPIC $RX_SRC/jit_compiler_x86_static.S -o /tmp/rx_jit_x86_static.o
 
-Install Golang and required packages:
+# Compile C++ files
+for f in aes_hash.cpp allocator.cpp assembly_generator_x86.cpp blake2_generator.cpp \
+         bytecode_machine.cpp cpu.cpp dataset.cpp instruction.cpp instructions_portable.cpp \
+         jit_compiler_x86.cpp randomx.cpp soft_aes.cpp superscalar.cpp virtual_machine.cpp \
+         vm_compiled.cpp vm_compiled_light.cpp vm_interpreted.cpp vm_interpreted_light.cpp; do
+    g++ -c -fPIC -O2 -std=c++11 -maes -mssse3 -I$RX_SRC -I$RX_SRC/blake2 $RX_SRC/$f -o /tmp/rx_$f.o
+done
 
-    sudo apt-get install golang
+# Create static library
+ar rcs randomx/lib/librandomx.a /tmp/rx_*.o
+```
 
-Clone stratum:
+### 2. Build the stratum server
 
-    git clone https://github.com/sammy007/monero-stratum.git
-    cd monero-stratum
+```bash
+git clone https://github.com/marscoin/marsqnet-stratum.git
+cd marsqnet-stratum
+go build -o marsqnet-stratum .
+```
 
-Build stratum:
+### 3. Configure
 
-    MONERO_DIR=/path/to/monero cmake .
-    make
+```bash
+cp config.example.json config.json
+# Edit config.json with your node's RPC port and cookie file path
+```
 
-`MONERO_DIR=/path/to/monero` is optional, not needed if both `monero` and `monero-stratum` is in the same directory like `/opt/src/`. By default make will search for monero libraries in `../monero`. You can just run `cmake .`.
+### 4. Run
 
-### Mac OS X
+```bash
+./marsqnet-stratum config.json
+```
 
-Compile Monero source:
+### 5. Connect a miner
 
-    git clone --recursive https://github.com/monero-project/monero.git
-    cd monero
-    git checkout tags/v0.14.0.0 -b v0.14.0.0
-    cmake .
-    make
-
-Install Golang and required packages:
-
-    brew update && brew install go
-
-Clone stratum:
-
-    git clone https://github.com/sammy007/monero-stratum.git
-    cd monero-stratum
-
-Build stratum:
-
-    MONERO_DIR=/path/to/monero cmake .
-    make
-
-### Running Stratum
-
-    ./build/bin/monero-stratum config.json
-
-If you need to bind to privileged ports and don't want to run from `root`:
-
-    sudo apt-get install libcap2-bin
-    sudo setcap 'cap_net_bind_service=+ep' /path/to/monero-stratum
+```bash
+./xmrig -a rx/0 -o stratum+tcp://YOUR_HOST:3434 -u YOUR_ADDRESS.worker1 -p x
+```
 
 ## Configuration
 
-Configuration is self-describing, just copy *config.example.json* to *config.json* and run stratum with path to config file as 1st argument.
-
-```javascript
+```json
 {
-  // Address for block rewards
-  "address": "YOUR-ADDRESS-NOT-EXCHANGE",
-  // Don't validate address
-  "bypassAddressValidation": true,
-  // Don't validate shares
-  "bypassShareValidation": true,
+    "address": "mqt1...",
+    "chain": "marsqnet",
+    "bypassAddressValidation": true,
 
-  "threads": 2,
+    "upstream": [{
+        "name": "marsqnet-local",
+        "host": "127.0.0.1",
+        "port": 49332,
+        "timeout": "10s",
+        "cookieFile": "/var/lib/marscoin-marsqnet/regtest/.cookie"
+    }],
 
-  "estimationWindow": "15m",
-  "luckWindow": "24h",
-  "largeLuckWindow": "72h",
+    "stratum": {
+        "timeout": "120s",
+        "listen": [{
+            "host": "0.0.0.0",
+            "port": 3434,
+            "diff": 1000,
+            "maxConn": 1024
+        }]
+    },
 
-  // Interval to poll daemon for new jobs
-  "blockRefreshInterval": "1s",
-
-  "stratum": {
-    // Socket timeout
-    "timeout": "15m",
-
-    "listen": [
-      {
-        "host": "0.0.0.0",
-        "port": 1111,
-        "diff": 5000,
-        "maxConn": 32768
-      },
-      {
-        "host": "0.0.0.0",
-        "port": 3333,
-        "diff": 10000,
-        "maxConn": 32768
-      }
-    ]
-  },
-
-  "frontend": {
-    "enabled": true,
-    "listen": "0.0.0.0:8082",
-    "login": "admin",
-    "password": "",
-    "hideIP": false
-  },
-
-  "upstreamCheckInterval": "5s",
-
-  "upstream": [
-    {
-      "name": "Main",
-      "host": "127.0.0.1",
-      "port": 18081,
-      "timeout": "10s"
-    }
-  ]
+    "blockRefreshInterval": "500ms"
 }
 ```
 
-You must use `anything.WorkerID` as username in your miner. Either disable address validation or use `<address>.WorkerID` as username. If there is no workerID specified your rig stats will be merged under `0` worker. If mining software contains dev fee rounds its stats will usually appear under `0` worker. This stratum acts like your own pool, the only exception is that you will get rewarded only after block found, shares only used for stats.
+| Field | Description |
+|---|---|
+| `address` | Pool payout address (marsqnet bech32 `mqt1...`) |
+| `upstream.port` | marsqnet node RPC port |
+| `upstream.cookieFile` | Path to the node's `.cookie` auth file |
+| `stratum.listen.port` | Port miners connect to |
+| `stratum.listen.diff` | Share difficulty for miners |
+| `blockRefreshInterval` | How often to poll for new block templates |
 
-### Donations
+## Architecture
 
-**XMR**: `47v4BWeUPFrM9YkYRYk2pkS9CubAPEc7BJjNjg4FvF66Y2oVrTAaBjDZhmFzAXgqCNRvBH2gupQ2gNag2FkP983ZMptvUWG`
+```
+CPU Miners (xmrig)
+    │
+    │ stratum protocol (login, submit, job)
+    ▼
+┌──────────────────┐
+│ marsqnet-stratum │
+│   (Go + RandomX) │
+│                  │
+│ - Job manager    │
+│ - Share validator │
+│ - Block submitter │
+└────────┬─────────┘
+         │ Bitcoin-style JSON-RPC
+         ▼
+┌──────────────────┐
+│  marsqnet node   │
+│ (Marscoin Core)  │
+│  RandomX PoW     │
+└──────────────────┘
+```
 
-![](https://cdn.pbrd.co/images/GP5tI1D.png)
+## How It Works
 
-Highly appreciated.
+1. **Template fetch** -- polls the node's `getblocktemplate` every 500ms
+2. **Job creation** -- builds a coinbase transaction, computes merkle root, serializes an 80-byte block header
+3. **Job distribution** -- sends the header blob + RandomX seed hash to connected miners
+4. **Share validation** -- when a miner submits a nonce, the stratum hashes the header with RandomX and checks against the share difficulty
+5. **Block submission** -- if a share also meets the network target, the full block is assembled and submitted via `submitblock`
 
-### License
+## Project Structure
+
+```
+marsqnet-stratum/
+├── main.go                 # Entry point
+├── config.json             # Runtime configuration
+├── pool/
+│   └── pool.go             # Config types
+├── rpc/
+│   └── rpc.go              # Bitcoin-style RPC client with cookie auth
+├── blockutil/
+│   └── blockutil.go        # Block construction (coinbase, merkle, headers)
+├── randomx/
+│   ├── randomx.go          # CGo bindings to librandomx
+│   ├── include/randomx.h   # RandomX C header
+│   └── lib/librandomx.a    # Compiled RandomX library (not committed)
+├── stratum/
+│   ├── stratum.go          # Stratum server (connections, jobs, shares, blocks)
+│   └── proto.go            # Protocol message types
+└── cmd/rpctest/
+    └── main.go             # Standalone test miner (for development)
+```
+
+## Why RandomX?
+
+Marscoin's marsqnet testnet replaces scrypt with RandomX to achieve:
+
+- **CPU-friendly mining** -- anyone with a laptop can mine, no ASICs needed
+- **ASIC resistance** -- RandomX is designed to be inefficient on specialized hardware
+- **Quantum readiness** -- preparing the network for post-quantum cryptography
+- **True decentralization** -- when mining is accessible to everyone, no single entity controls the hashrate
+
+## Credits
+
+- Adapted from [sammy007/monero-stratum](https://github.com/sammy007/monero-stratum) (Go stratum framework)
+- [RandomX](https://github.com/tevador/randomx) by tevador (PoW algorithm)
+- [Marscoin](https://marscoin.org) -- the cryptocurrency for Mars
+
+## License
 
 Released under the GNU General Public License v2.
 
