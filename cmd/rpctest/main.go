@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
+	"runtime"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/marscoin/marsqnet-stratum/blockutil"
@@ -16,6 +19,8 @@ import (
 
 func main() {
 	rand.Seed(time.Now().UnixNano())
+	numCPU := runtime.NumCPU()
+	runtime.GOMAXPROCS(numCPU)
 
 	cfg := pool.Upstream{
 		Name:       "marsqnet-local",
@@ -30,141 +35,148 @@ func main() {
 		log.Fatal("Failed to create RPC client:", err)
 	}
 
-	// 1. Get chain info
-	fmt.Println("=== Chain Info ===")
+	// Get chain info
 	mining, err := client.GetMiningInfo()
 	if err != nil {
 		log.Fatal("getmininginfo:", err)
 	}
-	fmt.Printf("Chain: %s, Height: %d, Difficulty: %f\n\n", mining.Chain, mining.Blocks, mining.Difficulty)
+	fmt.Printf("Chain: %s, Height: %d, Difficulty: %f\n", mining.Chain, mining.Blocks, mining.Difficulty)
 
-	// 2. Get block template
-	fmt.Println("=== Block Template ===")
+	// Get block template
 	tmpl, err := client.GetBlockTemplate()
 	if err != nil {
 		log.Fatal("getblocktemplate:", err)
 	}
 	data, _ := json.MarshalIndent(tmpl, "", "  ")
-	fmt.Printf("%s\n\n", data)
+	fmt.Printf("Template:\n%s\n\n", data)
 
-	// 3. Build a block from the template
-	fmt.Println("=== Building Block ===")
-
+	// Build block components
 	prevHash, err := blockutil.ReverseHexToBytes(tmpl.PreviousBlockHash)
 	if err != nil {
-		log.Fatal("prevhash decode:", err)
+		log.Fatal("prevhash:", err)
 	}
-
 	bits, err := blockutil.DecodeBits(tmpl.Bits)
 	if err != nil {
-		log.Fatal("bits decode:", err)
+		log.Fatal("bits:", err)
 	}
-
-	// Get a payout scriptPubKey from the node
-	// For testing, use OP_TRUE (0x51) as payout script
-	payoutScript := []byte{0x51}
-
-	// Build coinbase
-	extraNonce1 := rand.Uint32()
-	coinbaseTx := blockutil.BuildCoinbaseTx(
-		tmpl.Height,
-		tmpl.CoinbaseValue,
-		payoutScript,
-		extraNonce1,
-		0, // extraNonce2
-		nil, // no witness commitment for now
-	)
-	fmt.Printf("Coinbase TX: %d bytes\n", len(coinbaseTx))
-	fmt.Printf("Coinbase hex: %s\n\n", hex.EncodeToString(coinbaseTx))
-
-	// Compute coinbase hash
-	coinbaseHash := blockutil.TxHash(coinbaseTx)
-
-	// Collect transaction hashes for merkle tree
-	txHashes := [][32]byte{coinbaseHash}
-	var txDataList [][]byte
-	for _, tx := range tmpl.Transactions {
-		txBytes, _ := hex.DecodeString(tx.Data)
-		txDataList = append(txDataList, txBytes)
-
-		var txHash [32]byte
-		// Use the txid from the template (already in internal order for merkle)
-		hashBytes, _ := blockutil.ReverseHexToBytes(tx.TxID)
-		txHash = hashBytes
-		txHashes = append(txHashes, txHash)
-	}
-
-	// Compute merkle root
-	merkleRoot := blockutil.MerkleRoot(txHashes)
-	fmt.Printf("Merkle root: %s\n", hex.EncodeToString(merkleRoot[:]))
-
-	// Build header
-	header := &blockutil.BlockHeader{
-		Version:    int32(tmpl.Version),
-		PrevHash:   prevHash,
-		MerkleRoot: merkleRoot,
-		Timestamp:  uint32(tmpl.CurTime),
-		Bits:       bits,
-		Nonce:      0,
-	}
-
 	target, err := blockutil.TargetFromHex(tmpl.Target)
 	if err != nil {
-		log.Fatal("target parse:", err)
+		log.Fatal("target:", err)
 	}
-	fmt.Printf("Target: %s\n", hex.EncodeToString(target[:]))
-	fmt.Printf("Header (80 bytes): %s\n\n", hex.EncodeToString(header.Serialize()))
 
-	// 4. Initialize RandomX VM
-	fmt.Println("=== Initializing RandomX ===")
-	// Use the previous block hash as seed key (simplified - real impl uses seed height)
+	payoutScript := []byte{0x51} // OP_TRUE for testnet
+	extraNonce1 := rand.Uint32()
+
+	coinbaseTx := blockutil.BuildCoinbaseTx(
+		tmpl.Height, tmpl.CoinbaseValue, payoutScript,
+		extraNonce1, 0, nil,
+	)
+	coinbaseHash := blockutil.TxHash(coinbaseTx)
+	merkleRoot := blockutil.MerkleRoot([][32]byte{coinbaseHash})
+
+	fmt.Printf("Mining block %d with %d CPU cores (RandomX)\n", tmpl.Height, numCPU)
+	fmt.Printf("Target: %s\n\n", hex.EncodeToString(target[:]))
+
+	// Initialize RandomX VMs - one per thread
 	seedKey, _ := hex.DecodeString(tmpl.PreviousBlockHash)
-	vm, err := randomx.NewVM(seedKey)
-	if err != nil {
-		log.Fatal("RandomX init failed:", err)
-	}
-	defer vm.Close()
-	fmt.Println("RandomX VM ready")
+	fmt.Printf("Initializing %d RandomX VMs...\n", numCPU)
 
-	// 5. Mine with RandomX!
-	fmt.Println("\n=== Mining with RandomX ===")
+	vms := make([]*randomx.VM, numCPU)
+	for i := 0; i < numCPU; i++ {
+		vm, err := randomx.NewVM(seedKey)
+		if err != nil {
+			log.Fatalf("RandomX VM %d init failed: %v", i, err)
+		}
+		defer vm.Close()
+		vms[i] = vm
+	}
+	fmt.Println("All VMs ready. Mining...\n")
+
+	// Multi-threaded mining
+	var found int32
+	var totalHashes int64
 	startTime := time.Now()
 
-	for nonce := uint32(0); nonce < 100000000; nonce++ {
-		header.Nonce = nonce
-		headerBytes := header.Serialize()
-		hash := vm.Hash(headerBytes)
-
-		if nonce%10000 == 0 && nonce > 0 {
-			elapsed := time.Since(startTime).Seconds()
-			rate := float64(nonce) / elapsed
-			fmt.Printf("  Nonce %d, %.0f H/s\n", nonce, rate)
-		}
-
-		if blockutil.HashMeetsTarget(hash, target) {
-			fmt.Printf("Found valid hash at nonce %d!\n", nonce)
-			fmt.Printf("Hash: %s\n", blockutil.BytesToReverseHex(hash))
-
-			// Serialize the full block
-			fullBlock := blockutil.SerializeBlock(header, coinbaseTx, txDataList)
-			blockHex := hex.EncodeToString(fullBlock)
-			fmt.Printf("Block size: %d bytes\n\n", len(fullBlock))
-
-			// Try submitting
-			fmt.Println("=== Submitting block ===")
-			err := client.SubmitBlock(blockHex)
-			if err != nil {
-				fmt.Printf("Submit result: REJECTED - %v\n", err)
-				fmt.Println("(Expected: marsqnet uses RandomX, not SHA256d)")
-			} else {
-				fmt.Println("Submit result: ACCEPTED!")
-				// Check new height
-				newHeight, _ := client.GetBlockCount()
-				fmt.Printf("New height: %d\n", newHeight)
+	// Stats printer
+	go func() {
+		for {
+			time.Sleep(5 * time.Second)
+			if atomic.LoadInt32(&found) > 0 {
+				return
 			}
-			break
+			h := atomic.LoadInt64(&totalHashes)
+			elapsed := time.Since(startTime).Seconds()
+			fmt.Printf("  [%s] %d hashes, %.1f H/s (%d threads)\n",
+				time.Now().Format("15:04:05"), h, float64(h)/elapsed, numCPU)
 		}
+	}()
+
+	var wg sync.WaitGroup
+	nonceRange := uint32(0xFFFFFFFF) / uint32(numCPU)
+
+	for t := 0; t < numCPU; t++ {
+		wg.Add(1)
+		go func(threadID int, vm *randomx.VM) {
+			defer wg.Done()
+			startNonce := uint32(threadID) * nonceRange
+			endNonce := startNonce + nonceRange
+
+			header := &blockutil.BlockHeader{
+				Version:    int32(tmpl.Version),
+				PrevHash:   prevHash,
+				MerkleRoot: merkleRoot,
+				Timestamp:  uint32(tmpl.CurTime),
+				Bits:       bits,
+				Nonce:      startNonce,
+			}
+
+			for nonce := startNonce; nonce < endNonce; nonce++ {
+				if atomic.LoadInt32(&found) > 0 {
+					return
+				}
+
+				header.Nonce = nonce
+				headerBytes := header.Serialize()
+				hash := vm.Hash(headerBytes)
+				atomic.AddInt64(&totalHashes, 1)
+
+				if blockutil.HashMeetsTarget(hash, target) {
+					if !atomic.CompareAndSwapInt32(&found, 0, 1) {
+						return // another thread found it
+					}
+
+					elapsed := time.Since(startTime).Seconds()
+					h := atomic.LoadInt64(&totalHashes)
+					fmt.Printf("\n*** BLOCK FOUND! ***\n")
+					fmt.Printf("Thread: %d\n", threadID)
+					fmt.Printf("Nonce: %d\n", nonce)
+					fmt.Printf("Hash: %s\n", blockutil.BytesToReverseHex(hash))
+					fmt.Printf("Hashes: %d in %.1fs (%.1f H/s)\n\n", h, elapsed, float64(h)/elapsed)
+
+					// Build and submit
+					fullBlock := blockutil.SerializeBlock(header, coinbaseTx, nil)
+					blockHex := hex.EncodeToString(fullBlock)
+					fmt.Printf("Block size: %d bytes\n", len(fullBlock))
+					fmt.Println("Submitting to marsqnet node...")
+
+					err := client.SubmitBlock(blockHex)
+					if err != nil {
+						fmt.Printf("REJECTED: %v\n", err)
+					} else {
+						fmt.Println("*** ACCEPTED! Block submitted successfully! ***")
+						newHeight, _ := client.GetBlockCount()
+						fmt.Printf("New chain height: %d\n", newHeight)
+					}
+					return
+				}
+			}
+		}(t, vms[t])
 	}
 
-	fmt.Println("\n=== Test complete ===")
+	wg.Wait()
+
+	if atomic.LoadInt32(&found) == 0 {
+		h := atomic.LoadInt64(&totalHashes)
+		fmt.Printf("Exhausted nonce range (%d hashes) without finding block\n", h)
+	}
 }
