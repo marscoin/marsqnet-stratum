@@ -1,0 +1,34 @@
+[Unit]
+Description=Marsqnet RandomX Mining Pool Stratum
+Documentation=https://github.com/marscoin/marsqnet-stratum
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=marsqnet-pool
+Group=marsqnet-pool
+WorkingDirectory=/opt/marsqnet-stratum
+ExecStart=/opt/marsqnet-stratum/marsqnet-stratum /etc/marsqnet-stratum/config.json
+Restart=on-failure
+RestartSec=5s
+StandardOutput=append:/var/log/marsqnet-stratum/stratum.log
+StandardError=append:/var/log/marsqnet-stratum/stratum.log
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadWritePaths=/var/log/marsqnet-stratum
+
+# Resource limits
+LimitNOFILE=65536
+MemoryMax=1G
+
+[Install]
+WantedBy=multi-user.target

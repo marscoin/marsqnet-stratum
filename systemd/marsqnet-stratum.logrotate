@@ -1,0 +1,13 @@
+/var/log/marsqnet-stratum/*.log {
+    daily
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 marsqnet-pool marsqnet-pool
+    sharedscripts
+    postrotate
+        systemctl kill -s USR1 marsqnet-stratum.service 2>/dev/null || true
+    endscript
+}

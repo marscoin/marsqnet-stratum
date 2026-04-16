@@ -14,6 +14,12 @@ type Config struct {
 	LargeLuckWindow         string     `json:"largeLuckWindow"`
 	Threads                 int        `json:"threads"`
 	Frontend                Frontend   `json:"frontend"`
+	Metrics                 Metrics    `json:"metrics"`
+}
+
+type Metrics struct {
+	Enabled bool   `json:"enabled"`
+	Listen  string `json:"listen"`
 }
 
 type Stratum struct {

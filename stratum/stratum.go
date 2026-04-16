@@ -75,9 +75,10 @@ type StratumServer struct {
 	blocksMined  int64
 
 	// Stats
-	totalShares    int64
-	invalidShares  int64
-	staleShares    int64
+	totalShares   int64
+	invalidShares int64
+	staleShares   int64
+	rejects       RejectCounters
 }
 
 func NewStratumServer(cfg *pool.Config) *StratumServer {
@@ -284,6 +285,7 @@ func (s *StratumServer) handleSubmit(cs *Session, id *json.RawMessage, params *S
 	// Find the job
 	job := cs.findJob(params.JobId)
 	if job == nil {
+		atomic.AddInt64(&s.rejects.InvalidJobId, 1)
 		atomic.AddInt64(&s.staleShares, 1)
 		return cs.sendError(id, &ErrorReply{Code: -1, Message: "Invalid job id"})
 	}
@@ -291,7 +293,9 @@ func (s *StratumServer) handleSubmit(cs *Session, id *json.RawMessage, params *S
 	// Check stale
 	t := s.currentTemplate()
 	if t == nil || job.height != t.height {
+		atomic.AddInt64(&s.rejects.StaleJob, 1)
 		atomic.AddInt64(&s.staleShares, 1)
+		log.Printf("Stale share from %s: job height %d != template height %d", cs.login, job.height, t.height)
 		return cs.sendError(id, &ErrorReply{Code: -1, Message: "Stale job"})
 	}
 
@@ -300,6 +304,7 @@ func (s *StratumServer) handleSubmit(cs *Session, id *json.RawMessage, params *S
 	job.Lock()
 	if _, exists := job.nonces[nonce]; exists {
 		job.Unlock()
+		atomic.AddInt64(&s.rejects.DuplicateNonce, 1)
 		atomic.AddInt64(&s.invalidShares, 1)
 		return cs.sendError(id, &ErrorReply{Code: -1, Message: "Duplicate nonce"})
 	}
@@ -311,6 +316,7 @@ func (s *StratumServer) handleSubmit(cs *Session, id *json.RawMessage, params *S
 	copy(header, job.headerBlob)
 	nonceBytes, err := hex.DecodeString(nonce)
 	if err != nil || len(nonceBytes) != 4 {
+		atomic.AddInt64(&s.rejects.BadNonce, 1)
 		atomic.AddInt64(&s.invalidShares, 1)
 		return cs.sendError(id, &ErrorReply{Code: -1, Message: "Bad nonce"})
 	}
@@ -322,6 +328,7 @@ func (s *StratumServer) handleSubmit(cs *Session, id *json.RawMessage, params *S
 	// Check against share target (pool difficulty)
 	shareDiff := hashToDifficulty(hash)
 	if shareDiff == nil {
+		atomic.AddInt64(&s.rejects.BadHash, 1)
 		atomic.AddInt64(&s.invalidShares, 1)
 		return cs.sendError(id, &ErrorReply{Code: -1, Message: "Bad hash"})
 	}
@@ -329,6 +336,7 @@ func (s *StratumServer) handleSubmit(cs *Session, id *json.RawMessage, params *S
 	// Check if meets pool difficulty
 	poolDiff := big.NewInt(s.config.Stratum.Ports[0].Difficulty)
 	if shareDiff.Cmp(poolDiff) < 0 {
+		atomic.AddInt64(&s.rejects.LowDifficulty, 1)
 		atomic.AddInt64(&s.invalidShares, 1)
 		log.Printf("Low diff share from %s: %v < %v", cs.login, shareDiff, poolDiff)
 		return cs.sendError(id, &ErrorReply{Code: -1, Message: "Low difficulty"})
@@ -359,6 +367,7 @@ func (s *StratumServer) handleSubmit(cs *Session, id *json.RawMessage, params *S
 		blockHex := hex.EncodeToString(fullBlock)
 		err := s.rpcClient.SubmitBlock(blockHex)
 		if err != nil {
+			atomic.AddInt64(&s.rejects.SubmitBlockError, 1)
 			log.Printf("Block REJECTED: %v", err)
 		} else {
 			log.Printf("*** Block ACCEPTED! Height %d ***", t.height)

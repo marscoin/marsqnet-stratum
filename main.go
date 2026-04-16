@@ -25,6 +25,9 @@ func main() {
 	log.Println("==============================================")
 
 	s := stratum.NewStratumServer(&cfg)
+	if cfg.Metrics.Enabled {
+		s.StartMetricsServer(cfg.Metrics.Listen)
+	}
 	s.Listen()
 }
 
